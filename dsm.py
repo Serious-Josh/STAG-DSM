@@ -63,12 +63,6 @@ _DML_WARNED = False
 
 
 def torch_device(prefer: Optional[str] = "auto") -> torch.device:
-    """Pick the best available device.
-
-    prefer: one of {"auto","cpu","cuda","mps","dml"}
-      - auto: prefer CUDA, then MPS (Apple), else CPU
-      - dml: fallback alias; uses CUDA/MPS/CPU unless torch-directml is installed
-    """
     try:
         pref = (prefer or "auto").lower()
     except Exception:
@@ -144,18 +138,6 @@ def load_class_map(path: Optional[str]) -> Optional[dict]:
 
 
 class CsvImageDataset(Dataset):
-    """
-    Generic CSV-backed image dataset.
-
-    CSV format (no header expected by default):
-      image_path,label
-
-    - image_path: path to image, absolute or relative to root_dir
-    - label: integer class id (0..num_classes-1) or string mapped via class_map
-
-    This is flexible enough to cover AffectNet, RAF-DB, and DMD if you
-    pre-export annotations into a uniform CSV.
-    """
 
     def __init__(
         self,
@@ -740,16 +722,6 @@ def _gen_csv_from_folders(root_dir: str, out_csv: str, exts: set, class_map_in: 
 
 
 def _gen_csv_from_rafdb(root_dir: str, out_csv: str, split: str = "train", image_subdir: Optional[str] = None):
-    """Generate CSV for RAF-DB given its standard structure.
-
-    Expected layout (typical):
-      ROOT_DIR/
-        EmoLabel/list_train.txt or list_test.txt
-        Image/aligned/ or Image/original/
-
-    Each line in list_*.txt commonly contains: <image_name> <label>
-      - labels are typically 1..7; we convert to 0..6
-    """
     root_dir = os.path.abspath(root_dir)
     anno_dir = os.path.join(root_dir, "EmoLabel")
     if split == "train":
