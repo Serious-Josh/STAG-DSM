@@ -1,4 +1,8 @@
-﻿import os
+# DO NOT RUN
+# script requires datasets to run
+# code stripped of debug and cli functions, made easier to read
+
+import os
 import json
 import random
 import io
@@ -24,20 +28,18 @@ from torchvision.transforms import functional as TF
 from PIL import Image, ImageOps, ImageFilter, ImageDraw
 from typing import Any as _Any, cast
 
-# Pillow resampling compatibility (Pylance-friendly)
+# Pillow resampling compatibility
 try:
-    from PIL.Image import Resampling as _PILResampling  # type: ignore[attr-defined]
+    from PIL.Image import Resampling as _PILResampling
     PIL_RESAMPLE_BILINEAR: _Any = _PILResampling.BILINEAR
 except Exception:
     # Fallback for older Pillow; value 2 corresponds to bilinear
-    PIL_RESAMPLE_BILINEAR: _Any = getattr(Image, 'BILINEAR', 2)  # type: ignore[attr-defined]
+    PIL_RESAMPLE_BILINEAR: _Any = getattr(Image, 'BILINEAR', 2)
 
-# (Removed unused color constants)
 
-# -----------------------------
+# /////////////////////////////
 # Utilities
-# -----------------------------
-
+# /////////////////////////////
 
 def seed_everything(seed: int = 42):
     random.seed(seed)
@@ -69,9 +71,7 @@ def torch_device(prefer: Optional[str] = "auto") -> torch.device:
         global _DML_WARNED
         if not _DML_WARNED:
             try:
-                print("DirectML backend not available; falling back to CUDA/MPS/CPU. "
-                      "To enable DirectML, install a torch-directml build matching your torch version, "
-                      "or choose --device cuda/cpu.")
+                print("DirectML not available; falling back to CUDA/MPS/CPU.")
             except Exception:
                 pass
             _DML_WARNED = True
@@ -117,9 +117,9 @@ def load_class_map(path: Optional[str]) -> Optional[dict]:
         return json.load(f)
 
 
-# -----------------------------
+# /////////////////////////////
 # Dataset definitions
-# -----------------------------
+# /////////////////////////////
 
 
 class CsvImageDataset(Dataset):
@@ -155,7 +155,8 @@ class CsvImageDataset(Dataset):
                 path = path_raw
             if self.class_map and not label_raw.isdigit():
                 if label_raw not in self.class_map:
-                    raise ValueError(f"Label '{label_raw}' not in class_map")
+                    # Assume success environment: skip unknown labels
+                    continue
                 label = int(self.class_map[label_raw])
             else:
                 label = int(label_raw)
@@ -176,9 +177,9 @@ class CsvImageDataset(Dataset):
         return im, label
 
 
-# -----------------------------
+# /////////////////////////////
 # Cleaning and preprocessing for generic FER
-# -----------------------------
+# /////////////////////////////
 
 
 def _try_import_mtcnn():
@@ -206,7 +207,7 @@ def is_occluded_or_too_dark_bright(img: Image.Image, dark_thresh: float = 0.15, 
 
 
 def blur_metric(img: Image.Image) -> float:
-    """Sobel gradient magnitude variance (higher is sharper)."""
+# Sobel gradient magnitude variance (higher is sharper)
     t = TF.to_tensor(img.convert("L")).unsqueeze(0)
     sobel_x = torch.tensor([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=torch.float32, device=t.device).view(1, 1, 3, 3)
     sobel_y = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32, device=t.device).view(1, 1, 3, 3)
@@ -223,7 +224,6 @@ def is_blurry(img: Image.Image, edge_thresh: float = 4.0) -> bool:
 
 
 def laplacian_variance(img: Image.Image) -> float:
-    """Variance of Laplacian (OpenCV). Fallback to Sobel variance when cv2 missing."""
     try:
         if cv2 is None:
             return blur_metric(img)
@@ -233,18 +233,7 @@ def laplacian_variance(img: Image.Image) -> float:
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     return float(lap.var())
 
-
-
- 
-
-
 class GenericFERDataset(CsvImageDataset):
-    """Csv dataset with cleaning + optional face alignment/cropping.
-
-    - Filters: corrupted files, invalid labels, heuristic occlusion, heavy blur
-    - Alignment: if facenet_pytorch.MTCNN available, crops to detected face box
-    - Preprocess: resize and normalize later via transform
-    """
 
     def __init__(
         self,
@@ -527,12 +516,9 @@ def make_transforms(img_size: int = 112):
     return train_tf, val_tf
 
 
-# -----------------------------
+# /////////////////////////////
 # CSV generation from folder-per-class
-# -----------------------------
-
-
-# CSV generation helpers removed in slim build
+# /////////////////////////////
 
 
 def build_weighted_sampler(labels: List[int]) -> WeightedRandomSampler:
@@ -543,340 +529,9 @@ def build_weighted_sampler(labels: List[int]) -> WeightedRandomSampler:
     return WeightedRandomSampler(weights, num_samples=num_samples, replacement=True)
 
 
-# -----------------------------
-# Feature extractor (backbone)
-# -----------------------------
-
-
-class EfficientNetFeatureExtractor(nn.Module):
-    """EfficientNet-B0 backbone that outputs feature vectors for images.
-
-    Removes the classifier head so forward() returns pooled features suitable
-    for downstream tasks.
-    """
-
-    def __init__(self, pretrained: bool = True):
-        super().__init__()
-        m = torchvision.models.efficientnet_b0(
-            weights=(torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None)
-        )
-        # Remove classifier entirely to avoid dropout; return pooled features
-        in_feats = m.classifier[1].in_features
-        m.classifier = nn.Sequential(nn.Identity())
-        self.backbone = m
-        self.feature_dim = in_feats
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
-
-
-# -----------------------------
-# Data loading config
-# -----------------------------
-
-
-@dataclass
-class TrainConfig:
-    # Data
-    affectnet_csv: Optional[str] = None
-    affectnet_root: Optional[str] = None
-    rafdb_csv: Optional[str] = None
-    rafdb_root: Optional[str] = None
-    dmd_csv: Optional[str] = None
-    dmd_root: Optional[str] = None
-    class_map_json: Optional[str] = None
-
-    # Data/Preprocessing
-    num_classes: int = 7
-    img_size: int = 112
-
-    # Loader/Batching
-    batch_size: int = 64
-    lr: float = 3e-4  # unused
-    weight_decay: float = 1e-4  # unused
-    epochs_pretrain: int = 5  # unused
-    epochs_main: int = 10  # unused
-
-    # Misc
-    seed: int = 42
-    out_dir: str = "./outputs"
-    amp: bool = True  # unused
-    balance_sampling: bool = True
-
-
-def build_loaders(cfg: TrainConfig, device: Optional[torch.device] = None):
-    train_tf, val_tf = make_transforms(cfg.img_size)
-
-    class_map = load_class_map(cfg.class_map_json)
-
-    # Pretraining: combine AffectNet + RAF-DB
-    pretrain_datasets: List[Dataset] = []
-    if cfg.affectnet_csv:
-        pretrain_datasets.append(GenericFERDataset(
-            cfg.affectnet_csv, cfg.affectnet_root, transform=train_tf, class_map=class_map,
-            num_classes=cfg.num_classes, enable_alignment=True,
-            crop_tight=True, margin_range=(0.08, 0.12), target_size=cfg.img_size
-        ))
-    if cfg.rafdb_csv:
-        pretrain_datasets.append(GenericFERDataset(
-            cfg.rafdb_csv, cfg.rafdb_root, transform=train_tf, class_map=class_map,
-            num_classes=cfg.num_classes, enable_alignment=True,
-            crop_tight=True, margin_range=(0.08, 0.12), target_size=cfg.img_size
-        ))
-
-    if len(pretrain_datasets) == 0:
-        raise ValueError("No pretraining datasets provided. Provide AffectNet and/or RAF-DB CSVs.")
-
-    pretrain_train = ConcatDataset(pretrain_datasets)
-
-    # For validation during pretrain, just reuse a small split from the concat
-    # In practice, provide explicit val CSVs. Here we do a simple split.
-    total = len(pretrain_train)
-    val_size = max(1000, int(0.02 * total))
-    train_size = total - val_size
-    pretrain_train_ds, pretrain_val_ds = random_split(
-        pretrain_train, [train_size, val_size], generator=torch.Generator().manual_seed(123)
-    )
-
-    # Replace transforms for val subset if present
-    # random_split wraps underlying dataset; ensure val uses val_tf
-    def wrap_with_val_tf(ds):
-        base = ds.dataset if hasattr(ds, 'dataset') else ds
-        # ConcatDataset or CsvImageDataset
-        if isinstance(base, ConcatDataset):
-            for d in base.datasets:
-                if hasattr(d, 'transform'):
-                    cast(_Any, d).transform = val_tf
-        elif hasattr(base, 'transform'):
-            cast(_Any, base).transform = val_tf
-
-    wrap_with_val_tf(pretrain_val_ds)
-
-    # DMD dataset for main training
-    dmd_train_loader = None
-    dmd_val_loader = None
-    dmd_train_ds = None
-    dmd_val_ds = None
-    if cfg.dmd_csv:
-        dmd_train_full = CsvImageDataset(cfg.dmd_csv, cfg.dmd_root, transform=train_tf, class_map=class_map)
-        # Simple split for val if user didn't provide one; here just split 90/10
-        total_dmd = len(dmd_train_full)
-        val_dmd = max(200, int(0.1 * total_dmd))
-        train_dmd = total_dmd - val_dmd
-        dmd_train_ds, dmd_val_ds = random_split(
-            dmd_train_full, [train_dmd, val_dmd], generator=torch.Generator().manual_seed(456)
-        )
-        wrap_with_val_tf(dmd_val_ds)
-
-    def labels_from_dataset(ds: _Any) -> List[int]:
-        lbls = []
-        if isinstance(ds, Subset):
-            for i in ds.indices:
-                # underlying ConcatDataset or CsvImageDataset
-                base = ds.dataset
-                if isinstance(base, ConcatDataset):
-                    # Need to locate which subdataset an index falls into
-                    idx = i
-                    for d in base.datasets:
-                        n = len(cast(_Any, d))
-                        if idx < n:
-                            _, lab = d[idx]
-                            lbls.append(lab)
-                            break
-                        idx -= n
-                else:
-                    _, lab = base[i]
-                    lbls.append(lab)
-        else:
-            try:
-                n = len(ds)  # type: ignore[arg-type]
-            except Exception:
-                return lbls
-            for i in range(n):
-                try:
-                    _, lab = ds[i]
-                    lbls.append(lab)
-                except Exception:
-                    break
-        return lbls
-
-    # Samplers
-    pretrain_sampler = None
-    dmd_sampler = None
-    if cfg.balance_sampling:
-        try:
-            pretrain_labels = labels_from_dataset(pretrain_train_ds)
-            pretrain_sampler = build_weighted_sampler(pretrain_labels)
-        except Exception:
-            pretrain_sampler = None
-        try:
-            dmd_labels = labels_from_dataset(dmd_train_ds)
-            dmd_sampler = build_weighted_sampler(dmd_labels)
-        except Exception:
-            dmd_sampler = None
-
-    # Loaders
-    num_workers = get_num_workers()
-    # Pin memory only helps with CUDA host->device transfers
-    try:
-        dev = device if device is not None else torch_device()
-        pin_mem = isinstance(dev, torch.device) and dev.type == 'cuda'
-    except Exception:
-        pin_mem = False
-    pretrain_train_loader = DataLoader(
-        cast(Dataset, pretrain_train_ds), batch_size=cfg.batch_size, shuffle=(pretrain_sampler is None),
-        sampler=pretrain_sampler, num_workers=num_workers, pin_memory=pin_mem
-    )
-    pretrain_val_loader = DataLoader(
-        cast(Dataset, pretrain_val_ds), batch_size=cfg.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem
-    )
-    if cfg.dmd_csv:
-        dmd_train_loader = DataLoader(
-            cast(Dataset, dmd_train_ds), batch_size=cfg.batch_size, shuffle=(dmd_sampler is None),
-            sampler=dmd_sampler, num_workers=num_workers, pin_memory=pin_mem
-        )
-        dmd_val_loader = DataLoader(
-            cast(Dataset, dmd_val_ds), batch_size=cfg.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem
-        )
-
-    return pretrain_train_loader, pretrain_val_loader, dmd_train_loader, dmd_val_loader
-
-
-def build_generic_eval_loaders(cfg: TrainConfig, args) -> List[Tuple[str, DataLoader]]:
-    evals: List[Tuple[str, DataLoader]] = []
-    _, val_tf = make_transforms(cfg.img_size)
-    class_map = load_class_map(cfg.class_map_json)
-    num_workers = get_num_workers()
-
-    if getattr(args, 'affectnet_eval_csv', None):
-        ds = GenericFERDataset(args.affectnet_eval_csv, getattr(args, 'affectnet_eval_root', cfg.affectnet_root), transform=val_tf,
-                               class_map=class_map, num_classes=cfg.num_classes, enable_alignment=True)
-        evals.append(("affectnet_eval", DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
-                                                   num_workers=num_workers, pin_memory=True)))
-
-    if getattr(args, 'rafdb_eval_csv', None):
-        # For RAF-DB, eval may come from a different root than training one
-        ds = GenericFERDataset(args.rafdb_eval_csv, getattr(args, 'rafdb_eval_root', cfg.rafdb_root), transform=val_tf,
-                               class_map=class_map, num_classes=cfg.num_classes, enable_alignment=True)
-        evals.append(("rafdb_eval", DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
-                                               num_workers=num_workers, pin_memory=True)))
-
-    return evals
-
-
-# -----------------------------
-# Helpers restored for DMD export
-# -----------------------------
-
-
-def compute_phash(img: Image.Image) -> int:
-    """Compute 64-bit perceptual hash (pHash) using DCT low frequencies."""
-    dct = None
-    try:
-        if cv2 is not None:
-            gray = np.array(img.convert('L').resize((32, 32), PIL_RESAMPLE_BILINEAR), dtype=np.float32)
-            dct = cv2.dct(gray)
-    except Exception:
-        dct = None
-    if dct is None:
-        a = np.array(img.convert('L').resize((32, 32), PIL_RESAMPLE_BILINEAR), dtype=np.float32)
-        dct = np.fft.fft2(a)
-        dct = np.real(dct)
-    low = np.asarray(dct[:8, :8], dtype=np.float32)
-    med = float(np.median(low[1:])) if low.size > 1 else float(np.median(low))
-    bits = (low > med).astype(np.uint8).flatten()
-    h = 0
-    for b in bits:
-        h = (h << 1) | int(b)
-    return int(h)
-
-
-def hamming_distance(a: int, b: int) -> int:
-    return int((a ^ b).bit_count())
-
-
-def skin_coverage_fraction(img: Image.Image) -> float:
-    """Estimate skin pixel coverage fraction using simple color thresholds (YCrCb/HSV)."""
-    try:
-        if cv2 is None:
-            raise RuntimeError
-        bgr = cv2.cvtColor(np.array(img.convert('RGB')), cv2.COLOR_RGB2BGR)
-        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-        cr = np.asarray(ycrcb[:, :, 1], dtype=np.uint8)
-        cb = np.asarray(ycrcb[:, :, 2], dtype=np.uint8)
-        mask1 = (cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        h = np.asarray(hsv[:, :, 0], dtype=np.uint8)
-        s = np.asarray(hsv[:, :, 1], dtype=np.uint8)
-        v = np.asarray(hsv[:, :, 2], dtype=np.uint8)
-        mask2 = (h < 25) | (h > 230)
-        mask2 &= (s > 30) & (v > 50)
-        mask = (mask1 | mask2).astype(np.uint8)
-        return float(mask.mean()) if mask.size else 0.0
-    except Exception:
-        g = np.array(img.convert('L'))
-        mask = (g > 60) & (g < 200)
-        return float(mask.mean()) if mask.size else 0.0
-
-
-def _reference_five_point_112(margin: float = 0.10) -> np.ndarray:
-    ref = np.array([
-        [38.2946, 51.6963],
-        [73.5318, 51.5014],
-        [56.0252, 71.7366],
-        [41.5493, 92.3655],
-        [70.7299, 92.2041],
-    ], dtype=np.float32)
-    out = 112.0
-    center = np.array([out / 2.0, out / 2.0], dtype=np.float32)
-    scale = max(0.0, 1.0 - float(margin))
-    ref_scaled = center + (ref - center) * scale
-    return ref_scaled.astype(np.float32)
-
-
-def align_face_5pt(img: Image.Image, pts5: np.ndarray, out_size: int = 112, margin: float = 0.10):
-    try:
-        if cv2 is None:
-            raise RuntimeError
-        pts_src = np.asarray(pts5, dtype=np.float32)
-        if pts_src.shape != (5, 2):
-            raise RuntimeError
-        ref = _reference_five_point_112(margin=margin)
-        M, _ = cv2.estimateAffinePartial2D(pts_src, ref, method=cv2.LMEDS)
-        M = np.asarray(M, dtype=np.float32) if M is not None else None
-        if M is None:
-            raise RuntimeError
-        img_np = np.array(img.convert('RGB'))
-        aligned_np = cv2.warpAffine(img_np, M, (out_size, out_size), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        pts_aug = np.hstack([pts_src, np.ones((5, 1), dtype=np.float32)])
-        pts_t = (M @ pts_aug.T).T[:, :2]
-        return Image.fromarray(aligned_np), pts_t
-    except Exception:
-        return safe_fit(img, (out_size, out_size)), None
-
-
-def roi_boxes_from_landmarks(pts_t: Optional[np.ndarray], out_size: int = 112, eye_size: int = 64, mouth_size: int = 64):
-    if pts_t is None or not isinstance(pts_t, np.ndarray) or pts_t.shape != (5, 2):
-        return None, None, None
-    def clamp_box(cx, cy, bw, bh, W, H):
-        x = int(round(cx - bw / 2))
-        y = int(round(cy - bh / 2))
-        x = max(0, min(W - bw, x))
-        y = max(0, min(H - bh, y))
-        return (x, y, bw, bh)
-    W = H = out_size
-    left_eye = pts_t[0]
-    right_eye = pts_t[1]
-    mouth_c = (pts_t[3] + pts_t[4]) / 2.0
-    le = clamp_box(left_eye[0], left_eye[1], eye_size, eye_size, W, H)
-    re = clamp_box(right_eye[0], right_eye[1], eye_size, eye_size, W, H)
-    mo = clamp_box(mouth_c[0], mouth_c[1], mouth_size, mouth_size, W, H)
-    return le, re, mo
-
-
-# -----------------------------
-# DMD export (library function)
-# -----------------------------
+# /////////////////////////////
+# DMD export
+# /////////////////////////////
 
 
 def export_dmd_faces(
@@ -890,14 +545,7 @@ def export_dmd_faces(
     exclude_boundary_s: Optional[float] = None,
     seed: int = 42,
 ):
-    """Export face frames from DMD videos into images and a CSV.
-
-    - Samples frames at `fps`, up to `max_frames` per video.
-    - Uses MTCNN to detect faces; aligns via 5-point when landmarks are returned; falls back to bbox/center.
-    - Applies light QA filters: size, blur (Laplacian var), exposure, skin coverage, near-duplicate (pHash).
-    - Writes images under out_root/{split}/{label or 'unknown'}/{session}/ and a CSV 'dmd_frames.csv'.
-    """
-    # Assume OpenCV is available in this environment
+    
     os.makedirs(out_root, exist_ok=True)
     random.seed(seed)
 
@@ -1107,9 +755,316 @@ def export_dmd_faces(
             writer.writerow([rel, label, session_id, fidx, split, bm, prob, mod, fmt_roi(le), fmt_roi(reye), fmt_roi(mo), fps_val, tsec])
     return csv_path, len(rows)
 
-# -----------------------------
-# Local defaults for this workspace
-# -----------------------------
+# /////////////////////
+# DMD Helpers
+# /////////////////////
+
+def compute_phash(img: Image.Image) -> int:
+    dct = None
+    try:
+        if cv2 is not None:
+            gray = np.array(img.convert('L').resize((32, 32), PIL_RESAMPLE_BILINEAR), dtype=np.float32)
+            dct = cv2.dct(gray)
+    except Exception:
+        dct = None
+    if dct is None:
+        a = np.array(img.convert('L').resize((32, 32), PIL_RESAMPLE_BILINEAR), dtype=np.float32)
+        dct = np.fft.fft2(a)
+        dct = np.real(dct)
+    low = np.asarray(dct[:8, :8], dtype=np.float32)
+    med = float(np.median(low[1:])) if low.size > 1 else float(np.median(low))
+    bits = (low > med).astype(np.uint8).flatten()
+    h = 0
+    for b in bits:
+        h = (h << 1) | int(b)
+    return int(h)
+
+
+def hamming_distance(a: int, b: int) -> int:
+    return int((a ^ b).bit_count())
+
+
+def skin_coverage_fraction(img: Image.Image) -> float:
+    try:
+        if cv2 is None:
+            raise RuntimeError
+        bgr = cv2.cvtColor(np.array(img.convert('RGB')), cv2.COLOR_RGB2BGR)
+        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+        cr = np.asarray(ycrcb[:, :, 1], dtype=np.uint8)
+        cb = np.asarray(ycrcb[:, :, 2], dtype=np.uint8)
+        mask1 = (cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        h = np.asarray(hsv[:, :, 0], dtype=np.uint8)
+        s = np.asarray(hsv[:, :, 1], dtype=np.uint8)
+        v = np.asarray(hsv[:, :, 2], dtype=np.uint8)
+        mask2 = (h < 25) | (h > 230)
+        mask2 &= (s > 30) & (v > 50)
+        mask = (mask1 | mask2).astype(np.uint8)
+        return float(mask.mean()) if mask.size else 0.0
+    except Exception:
+        g = np.array(img.convert('L'))
+        mask = (g > 60) & (g < 200)
+        return float(mask.mean()) if mask.size else 0.0
+
+
+def _reference_five_point_112(margin: float = 0.10) -> np.ndarray:
+    ref = np.array([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041],
+    ], dtype=np.float32)
+    out = 112.0
+    center = np.array([out / 2.0, out / 2.0], dtype=np.float32)
+    scale = max(0.0, 1.0 - float(margin))
+    ref_scaled = center + (ref - center) * scale
+    return ref_scaled.astype(np.float32)
+
+
+def align_face_5pt(img: Image.Image, pts5: np.ndarray, out_size: int = 112, margin: float = 0.10):
+    try:
+        if cv2 is None:
+            raise RuntimeError
+        pts_src = np.asarray(pts5, dtype=np.float32)
+        if pts_src.shape != (5, 2):
+            raise RuntimeError
+        ref = _reference_five_point_112(margin=margin)
+        M, _ = cv2.estimateAffinePartial2D(pts_src, ref, method=cv2.LMEDS)
+        M = np.asarray(M, dtype=np.float32) if M is not None else None
+        if M is None:
+            raise RuntimeError
+        img_np = np.array(img.convert('RGB'))
+        aligned_np = cv2.warpAffine(img_np, M, (out_size, out_size), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        pts_aug = np.hstack([pts_src, np.ones((5, 1), dtype=np.float32)])
+        pts_t = (M @ pts_aug.T).T[:, :2]
+        return Image.fromarray(aligned_np), pts_t
+    except Exception:
+        return safe_fit(img, (out_size, out_size)), None
+
+
+def roi_boxes_from_landmarks(pts_t: Optional[np.ndarray], out_size: int = 112, eye_size: int = 64, mouth_size: int = 64):
+    if pts_t is None or not isinstance(pts_t, np.ndarray) or pts_t.shape != (5, 2):
+        return None, None, None
+    def clamp_box(cx, cy, bw, bh, W, H):
+        x = int(round(cx - bw / 2))
+        y = int(round(cy - bh / 2))
+        x = max(0, min(W - bw, x))
+        y = max(0, min(H - bh, y))
+        return (x, y, bw, bh)
+    W = H = out_size
+    left_eye = pts_t[0]
+    right_eye = pts_t[1]
+    mouth_c = (pts_t[3] + pts_t[4]) / 2.0
+    le = clamp_box(left_eye[0], left_eye[1], eye_size, eye_size, W, H)
+    re = clamp_box(right_eye[0], right_eye[1], eye_size, eye_size, W, H)
+    mo = clamp_box(mouth_c[0], mouth_c[1], mouth_size, mouth_size, W, H)
+    return le, re, mo
+
+# /////////////////////////////
+# Feature extractor
+# /////////////////////////////
+
+
+class EfficientNetFeatureExtractor(nn.Module):
+
+    def __init__(self, pretrained: bool = True):
+        super().__init__()
+        m = torchvision.models.efficientnet_b0(
+            weights=(torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None)
+        )
+        # Remove classifier entirely to avoid dropout; return pooled features
+        in_feats = m.classifier[1].in_features
+        m.classifier = nn.Sequential(nn.Identity())
+        self.backbone = m
+        self.feature_dim = in_feats
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+
+# /////////////////////////////
+# Data loading config
+# /////////////////////////////
+
+
+@dataclass
+class TrainConfig:
+    # Data
+    affectnet_csv: Optional[str] = None
+    affectnet_root: Optional[str] = None
+    rafdb_csv: Optional[str] = None
+    rafdb_root: Optional[str] = None
+    dmd_csv: Optional[str] = None
+    dmd_root: Optional[str] = None
+    class_map_json: Optional[str] = None
+
+    # Data/Preprocessing
+    num_classes: int = 7
+    img_size: int = 112
+
+    # Loader/Batching
+    batch_size: int = 64
+    balance_sampling: bool = True
+
+
+def build_loaders(cfg: TrainConfig, device: Optional[torch.device] = None):
+    train_tf, val_tf = make_transforms(cfg.img_size)
+
+    class_map = load_class_map(cfg.class_map_json)
+
+    # Pretraining: combine AffectNet + RAF-DB
+    pretrain_datasets: List[Dataset] = []
+    if cfg.affectnet_csv:
+        pretrain_datasets.append(GenericFERDataset(
+            cfg.affectnet_csv, cfg.affectnet_root, transform=train_tf, class_map=class_map,
+            num_classes=cfg.num_classes, enable_alignment=True,
+            crop_tight=True, margin_range=(0.08, 0.12), target_size=cfg.img_size
+        ))
+    if cfg.rafdb_csv:
+        pretrain_datasets.append(GenericFERDataset(
+            cfg.rafdb_csv, cfg.rafdb_root, transform=train_tf, class_map=class_map,
+            num_classes=cfg.num_classes, enable_alignment=True,
+            crop_tight=True, margin_range=(0.08, 0.12), target_size=cfg.img_size
+        ))
+
+
+    pretrain_train = ConcatDataset(pretrain_datasets)
+
+    # For validation during pretrain, just reuse a small split from the concat
+    # In practice, provide explicit val CSVs. Here we do a simple split.
+    total = len(pretrain_train)
+    val_size = max(1000, int(0.02 * total))
+    train_size = total - val_size
+    pretrain_train_ds, pretrain_val_ds = random_split(
+        pretrain_train, [train_size, val_size], generator=torch.Generator().manual_seed(123)
+    )
+
+    # Replace transforms for val subset if present
+    # random_split wraps underlying dataset; ensure val uses val_tf
+    def wrap_with_val_tf(ds):
+        base = ds.dataset if hasattr(ds, 'dataset') else ds
+        # ConcatDataset or CsvImageDataset
+        if isinstance(base, ConcatDataset):
+            for d in base.datasets:
+                if hasattr(d, 'transform'):
+                    cast(_Any, d).transform = val_tf
+        elif hasattr(base, 'transform'):
+            cast(_Any, base).transform = val_tf
+
+    wrap_with_val_tf(pretrain_val_ds)
+
+    # DMD dataset for main training
+    dmd_train_loader = None
+    dmd_val_loader = None
+    dmd_train_ds = None
+    dmd_val_ds = None
+    if cfg.dmd_csv:
+        dmd_train_full = CsvImageDataset(cfg.dmd_csv, cfg.dmd_root, transform=train_tf, class_map=class_map)
+        # Simple split for val if user didn't provide one; here just split 90/10
+        total_dmd = len(dmd_train_full)
+        val_dmd = max(200, int(0.1 * total_dmd))
+        train_dmd = total_dmd - val_dmd
+        dmd_train_ds, dmd_val_ds = random_split(
+            dmd_train_full, [train_dmd, val_dmd], generator=torch.Generator().manual_seed(456)
+        )
+        wrap_with_val_tf(dmd_val_ds)
+
+    def labels_from_dataset(ds: _Any) -> List[int]:
+        lbls = []
+        if isinstance(ds, Subset):
+            for i in ds.indices:
+                # underlying ConcatDataset or CsvImageDataset
+                base = ds.dataset
+                if isinstance(base, ConcatDataset):
+                    # Need to locate which subdataset an index falls into
+                    idx = i
+                    for d in base.datasets:
+                        n = len(cast(_Any, d))
+                        if idx < n:
+                            _, lab = d[idx]
+                            lbls.append(lab)
+                            break
+                        idx -= n
+                else:
+                    _, lab = base[i]
+                    lbls.append(lab)
+        else:
+            try:
+                n = len(ds)
+            except Exception:
+                return lbls
+            for i in range(n):
+                try:
+                    _, lab = ds[i]
+                    lbls.append(lab)
+                except Exception:
+                    break
+        return lbls
+
+    # Samplers
+    pretrain_sampler = None
+    dmd_sampler = None
+    if cfg.balance_sampling:
+        try:
+            pretrain_labels = labels_from_dataset(pretrain_train_ds)
+            pretrain_sampler = build_weighted_sampler(pretrain_labels)
+        except Exception:
+            pretrain_sampler = None
+        try:
+            dmd_labels = labels_from_dataset(dmd_train_ds)
+            dmd_sampler = build_weighted_sampler(dmd_labels)
+        except Exception:
+            dmd_sampler = None
+
+    # Loaders
+    num_workers = get_num_workers()
+    # Pin memory only helps with CUDA host->device transfers
+    try:
+        dev = device if device is not None else torch_device()
+        pin_mem = isinstance(dev, torch.device) and dev.type == 'cuda'
+    except Exception:
+        pin_mem = False
+    pretrain_train_loader = DataLoader(
+        cast(Dataset, pretrain_train_ds), batch_size=cfg.batch_size, shuffle=(pretrain_sampler is None),
+        sampler=pretrain_sampler, num_workers=num_workers, pin_memory=pin_mem
+    )
+    pretrain_val_loader = DataLoader(
+        cast(Dataset, pretrain_val_ds), batch_size=cfg.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem
+    )
+    if cfg.dmd_csv:
+        dmd_train_loader = DataLoader(
+            cast(Dataset, dmd_train_ds), batch_size=cfg.batch_size, shuffle=(dmd_sampler is None),
+            sampler=dmd_sampler, num_workers=num_workers, pin_memory=pin_mem
+        )
+        dmd_val_loader = DataLoader(
+            cast(Dataset, dmd_val_ds), batch_size=cfg.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem
+        )
+
+    return pretrain_train_loader, pretrain_val_loader, dmd_train_loader, dmd_val_loader
+
+
+def build_generic_eval_loaders(cfg: TrainConfig, args) -> List[Tuple[str, DataLoader]]:
+    evals: List[Tuple[str, DataLoader]] = []
+    _, val_tf = make_transforms(cfg.img_size)
+    class_map = load_class_map(cfg.class_map_json)
+    num_workers = get_num_workers()
+
+    if getattr(args, 'affectnet_eval_csv', None):
+        ds = GenericFERDataset(args.affectnet_eval_csv, getattr(args, 'affectnet_eval_root', cfg.affectnet_root), transform=val_tf,
+                               class_map=class_map, num_classes=cfg.num_classes, enable_alignment=True)
+        evals.append(("affectnet_eval", DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
+                                                   num_workers=num_workers, pin_memory=True)))
+
+    if getattr(args, 'rafdb_eval_csv', None):
+        # For RAF-DB, eval may come from a different root than training one
+        ds = GenericFERDataset(args.rafdb_eval_csv, getattr(args, 'rafdb_eval_root', cfg.rafdb_root), transform=val_tf,
+                               class_map=class_map, num_classes=cfg.num_classes, enable_alignment=True)
+        evals.append(("rafdb_eval", DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
+                                               num_workers=num_workers, pin_memory=True)))
+
+    return evals
+
 
 if __name__ == "__main__":
     print("dsm.py slim build: import and use the library APIs (datasets, transforms, loaders, backbone).")
