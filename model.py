@@ -4,6 +4,10 @@ import torch.nn.functional as F
 import torchvision
 from typing import Optional
 
+# /////////////////////////////////
+# ARCHITECTURE 1: ROI + Temporal EfficientNet
+# /////////////////////////////////
+
 
 # EfficientNet backbone with dual-branch head (eyes + mouth) and temporal mean pooling
 # Inputs: tensor of [B, C, H, W]/[B, T, C, H, W]
@@ -101,17 +105,7 @@ class EfficientNetFeatureExtractor(nn.Module):
         return fused
 
 
-class SoftmaxHead(nn.Module):
-    def __init__(self, in_dim: int, num_classes: int, p_drop: float = 0.2):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(in_dim)
-        self.drop = nn.Dropout(p_drop)
-        self.fc = nn.Linear(in_dim, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.bn(x)
-        x = self.drop(x)
-        return self.fc(x)
+# (Softmax head removed; we use ArcFace exclusively)
 
 
 class ArcFaceHead(nn.Module):
@@ -142,20 +136,13 @@ class ArcFaceHead(nn.Module):
 # Not actually used, this is mostly for demonstration. Actual running code instantiates backbone/head seperately.
 # Instantiation of the backbone/head.
 class DSMModel(nn.Module):
-    def __init__(self, num_classes: int, head: str = 'arcface', pretrained: bool = True):
+    def __init__(self, num_classes: int, pretrained: bool = True):
         super().__init__()
         # EfficientNetFeatureExtractor internally loads ImageNet weights for B0.
         self.backbone = EfficientNetFeatureExtractor()
         in_dim = self.backbone.feature_dim
-        head = (head or 'arcface').lower()
-        if head == 'softmax':
-            self.head_type = 'softmax'
-            self.head = SoftmaxHead(in_dim, num_classes)
-        elif head == 'arcface':
-            self.head_type = 'arcface'
-            self.head = ArcFaceHead(in_dim, num_classes)
-        else:
-            raise ValueError("head must be 'softmax' or 'arcface'")
+        self.head_type = 'arcface'
+        self.head = ArcFaceHead(in_dim, num_classes)
 
     @property
     def feature_dim(self) -> int:
@@ -163,11 +150,102 @@ class DSMModel(nn.Module):
 
     def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
         feats = self.backbone(x)
-        if self.head_type == 'softmax':
-            return self.head(feats)
-        else:
-            return self.head(feats, labels)
+        return self.head(feats, labels)
 
 
-def build_model(num_classes: int, head: str = 'arcface', pretrained: bool = True) -> DSMModel:
-    return DSMModel(num_classes=num_classes, head=head, pretrained=pretrained)
+
+# //////////////////////////////////
+# ARCHITECTURE 2: Multi-Scale Fusion EfficientNet
+# //////////////////////////////////
+
+# Fuses EfficientNet early/mid/late feature maps
+class MultiScaleFusionEfficientNet(nn.Module):
+
+    def __init__(self, num_classes: int, proj_channels: int = 256, fuse_out_channels: int = 256, dropout: float = 0.2, verbose: bool = False):
+        super().__init__()
+        # EfficientNet-B0 backbone, same weights/preprocessing as existing
+        m = torchvision.models.efficientnet_b0(torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+        m.classifier = nn.Sequential(nn.Identity())
+        self.backbone = m
+        self.verbose = bool(verbose)
+
+        # Known channel sizes for B0 taps (features indices: 2, 4, 8)
+        c_low, c_mid, c_high = 24, 80, 1280
+        self.proj_low = nn.Sequential(nn.Conv2d(c_low, proj_channels, kernel_size=1, bias=False), nn.BatchNorm2d(proj_channels), nn.ReLU(inplace=True))
+        self.proj_mid = nn.Sequential(nn.Conv2d(c_mid, proj_channels, kernel_size=1, bias=False), nn.BatchNorm2d(proj_channels), nn.ReLU(inplace=True))
+        self.proj_high = nn.Sequential(nn.Conv2d(c_high, proj_channels, kernel_size=1, bias=False), nn.BatchNorm2d(proj_channels), nn.ReLU(inplace=True))
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(proj_channels * 3, fuse_out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(fuse_out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=float(dropout)) if dropout and dropout > 0 else nn.Identity(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feature_dim = fuse_out_channels
+        self.head_type = 'arcface'
+        self.head = ArcFaceHead(self.feature_dim, num_classes)
+
+    def _tap_features_b0(self, x: torch.Tensor):
+        # Collect outputs at indices 2 (low), 4 (mid), 8 (high)
+        feats = self.backbone.features
+        out = x
+        f_low = f_mid = f_high = None
+        for i, layer in enumerate(feats):
+            out = layer(out)
+            if i == 2:
+                f_low = out
+            elif i == 4:
+                f_mid = out
+            elif i == 8:
+                f_high = out
+        return f_low, f_mid, f_high
+
+    def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Accept [B, C, H, W]; if [B, T, C, H, W] take the last frame (no temporal pooling here)
+        if x.dim() == 5:
+            x = x[:, -1]  # last frame
+        f_low, f_mid, f_high = self._tap_features_b0(x)
+        # Project to common channels
+        p_low = self.proj_low(f_low)
+        p_mid = self.proj_mid(f_mid)
+        p_high = self.proj_high(f_high)
+        # Align spatial size to low
+        H, W = p_low.shape[2], p_low.shape[3]
+        p_mid = F.interpolate(p_mid, size=(H, W), mode='bilinear', align_corners=False)
+        p_high = F.interpolate(p_high, size=(H, W), mode='bilinear', align_corners=False)
+        fused = torch.cat([p_low, p_mid, p_high], dim=1)
+        fused = self.fuse(fused)
+        if self.verbose:
+            print(f"[MultiScaleFusion] fused feature map: {fused.shape}")
+        vec = torch.flatten(self.pool(fused), 1)
+        return self.head(vec, labels)
+
+# Model builder
+def build_model(*args, **kwargs):
+    arch = kwargs.pop('arch', 'roi_temporal')
+    # Backwards compatibility: first positional may be num_classes
+    num_classes = kwargs.pop('num_classes', None)
+    if num_classes is None and args:
+        num_classes = args[0]
+        args = args[1:]
+    if arch == 'roi_temporal':
+        return DSMModel(num_classes=num_classes)
+    elif arch == 'multiscale':
+        return MultiScaleFusionEfficientNet(num_classes=num_classes, **kwargs)
+    else:
+        raise ValueError("arch must be 'roi_temporal' or 'multiscale'")
+
+
+def save_checkpoint(model: nn.Module, path: str, arch: str, extra: Optional[dict] = None) -> None:
+    state = {
+        'arch': arch,
+        'head_type': getattr(model, 'head_type', None),
+        'feature_dim': getattr(model, 'feature_dim', None),
+    }
+    # Expect wrapper with backbone and head
+    if hasattr(model, 'backbone') and hasattr(model, 'head'):
+        state['extractor'] = model.backbone.state_dict()
+        state['head'] = model.head.state_dict()
+    state.update(extra or {})
+    torch.save(state, path)
