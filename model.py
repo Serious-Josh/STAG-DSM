@@ -1,3 +1,6 @@
+# CSCI 495 Phase 3 Code
+# Basharat Tunio, Derek Owen, Josh Chapman, Madison Bentley
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,7 +8,7 @@ import torchvision
 from typing import Optional
 
 # /////////////////////////////////
-# ARCHITECTURE 1: ROI + Temporal EfficientNet
+# ARCHITECTURE 1: ROI Branching + Temporal Pooling
 # /////////////////////////////////
 
 
@@ -41,20 +44,20 @@ class EfficientNetFeatureExtractor(nn.Module):
         reye = (int(112 * 0.65 - 32), int(112 * 0.46 - 32), 64, 64)
         mouth = (int(112 * 0.50 - 32), int(112 * 0.82 - 32), 64, 64)
         # Clamp to valid bounds just in case
-        def _clamp_box(box):
+        def clamp_box(box):
             x, y, w, h = box
             x = max(0, min(112 - w, x))
             y = max(0, min(112 - h, y))
             return (x, y, w, h)
 
-        leye = _clamp_box(leye)
-        reye = _clamp_box(reye)
-        mouth = _clamp_box(mouth)
-        self.register_buffer('_roi_leye', torch.tensor(leye, dtype=torch.float32))
-        self.register_buffer('_roi_reye', torch.tensor(reye, dtype=torch.float32))
-        self.register_buffer('_roi_mouth', torch.tensor(mouth, dtype=torch.float32))
+        leye = clamp_box(leye)
+        reye = clamp_box(reye)
+        mouth = clamp_box(mouth)
+        self.register_buffer('roi_leye', torch.tensor(leye, dtype=torch.float32))
+        self.register_buffer('roi_reye', torch.tensor(reye, dtype=torch.float32))
+        self.register_buffer('roi_mouth', torch.tensor(mouth, dtype=torch.float32))
 
-    def _pool_roi(self, fmap: torch.Tensor, box_112: torch.Tensor) -> torch.Tensor:
+    def pool_roi(self, fmap: torch.Tensor, box_112: torch.Tensor) -> torch.Tensor:
         # fmap: [N, C, Hf, Wf] from last conv; box_112: [4] (x,y,w,h) in 112x112 space
         _, _, Hf, Wf = fmap.shape
         scale_x = Wf / 112.0
@@ -86,10 +89,10 @@ class EfficientNetFeatureExtractor(nn.Module):
         # ROI features
         z = self.roi_proj_bn(self.roi_proj(feats_map))
         z = F.relu(z, inplace=True)
-        leye = self._pool_roi(z, self._roi_leye)
-        reye = self._pool_roi(z, self._roi_reye)
+        leye = self.pool_roi(z, self.roi_leye)
+        reye = self.pool_roi(z, self.roi_reye)
         eyes_512 = 0.5 * (leye + reye)
-        mouth_512 = self._pool_roi(z, self._roi_mouth)
+        mouth_512 = self.pool_roi(z, self.roi_mouth)
         eyes_128 = self.roi_mlp(eyes_512)
         mouth_128 = self.roi_mlp(mouth_512)
 
@@ -186,7 +189,7 @@ class MultiScaleFusionEfficientNet(nn.Module):
         self.head_type = 'arcface'
         self.head = ArcFaceHead(self.feature_dim, num_classes)
 
-    def _tap_features_b0(self, x: torch.Tensor):
+    def tap_features_b0(self, x: torch.Tensor):
         # Collect outputs at indices 2 (low), 4 (mid), 8 (high)
         feats = self.backbone.features
         out = x
@@ -205,7 +208,7 @@ class MultiScaleFusionEfficientNet(nn.Module):
         # Accept [B, C, H, W]; if [B, T, C, H, W] take the last frame (no temporal pooling here)
         if x.dim() == 5:
             x = x[:, -1]  # last frame
-        f_low, f_mid, f_high = self._tap_features_b0(x)
+        f_low, f_mid, f_high = self.tap_features_b0(x)
         # Project to common channels
         p_low = self.proj_low(f_low)
         p_mid = self.proj_mid(f_mid)
