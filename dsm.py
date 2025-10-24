@@ -16,7 +16,6 @@ import multiprocessing as mp
 from collections import Counter, deque
 import subprocess
 from tqdm.auto import tqdm as _tqdm
-from facenet_pytorch import MTCNN as _MTCNN
 import cv2
 import pandas as pd
 
@@ -59,53 +58,9 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-_DML_WARNED = False
-
-
 def torch_device(prefer: Optional[str] = "auto") -> torch.device:
-    try:
-        pref = (prefer or "auto").lower()
-    except Exception:
-        pref = "auto"
-
-    # Helper to check MPS
-    def _mps_available() -> bool:
-        try:
-            mps = getattr(torch.backends, "mps", None)
-            return bool(mps) and bool(getattr(mps, "is_available", lambda: False)())
-        except Exception:
-            return False
-
-    # DirectML replacement/fallback: not available without torch-directml
-    def _warn_dml():
-        global _DML_WARNED
-        if not _DML_WARNED:
-            try:
-                print("DirectML backend not available; falling back to CUDA/MPS/CPU. "
-                      "To enable DirectML, install a torch-directml build matching your torch version, "
-                      "or choose --device cuda/cpu.")
-            except Exception:
-                pass
-            _DML_WARNED = True
-
-    if pref == "cuda" and torch.cuda.is_available():
-        return torch.device("cuda")
-    if pref == "mps" and _mps_available():
-        return torch.device("mps")
-    if pref == "dml":
-        _warn_dml()
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if _mps_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-
-    if pref == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if _mps_available():
-            return torch.device("mps")
-    return torch.device("cpu")
+    # Simplified device selection: prefer CUDA if available, else CPU
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def get_num_workers() -> int:
@@ -116,7 +71,6 @@ def get_num_workers() -> int:
 
 
 def progress(iterable, total: Optional[int] = None, unit: str = "it", desc: Optional[str] = None, leave: bool = False):
-    """Return a tqdm-wrapped iterable if tqdm is available; otherwise the original iterable."""
     if _tqdm is not None:
         try:
             return _tqdm(iterable, total=total, unit=unit, desc=desc, leave=leave)
@@ -194,11 +148,6 @@ class CsvImageDataset(Dataset):
 # -----------------------------
 # Cleaning and preprocessing for generic FER
 # -----------------------------
-
-
-def _try_import_mtcnn():
-    return _MTCNN
-
 
 def is_image_corrupted(path: str) -> bool:
     try:
@@ -329,9 +278,6 @@ def _reference_five_point_112(margin: float = 0.10) -> np.ndarray:
 
 
 def align_face_5pt(img: Image.Image, pts5: np.ndarray, out_size: int = 112, margin: float = 0.10):
-    """Similarity-align face using 5-point landmarks to 112x112 output.
-    Returns (aligned_PIL, transformed_landmarks ndarray [5,2]). Falls back to center-fit on failure.
-    """
     if cv2 is None:
         # Without OpenCV, return center-fit
         try:
@@ -367,9 +313,6 @@ def align_face_5pt(img: Image.Image, pts5: np.ndarray, out_size: int = 112, marg
 
 
 def roi_boxes_from_landmarks(pts_t: Optional[np.ndarray], out_size: int = 112, eye_size: int = 64, mouth_size: int = 64):
-    """Compute ROI boxes (x,y,w,h) for left_eye, right_eye, mouth in aligned image coords.
-    Returns tuple of three boxes, each as (x, y, w, h). Boxes are clamped to image bounds.
-    """
     def clamp_box(cx, cy, bw, bh, W, H):
         x = int(round(cx - bw / 2))
         y = int(round(cy - bh / 2))
@@ -390,12 +333,6 @@ def roi_boxes_from_landmarks(pts_t: Optional[np.ndarray], out_size: int = 112, e
 
 
 class GenericFERDataset(CsvImageDataset):
-    """Csv dataset with cleaning + optional face alignment/cropping.
-
-    - Filters: corrupted files, invalid labels, heuristic occlusion, heavy blur
-    - Alignment: if facenet_pytorch.MTCNN available, crops to detected face box
-    - Preprocess: resize and normalize later via transform
-    """
 
     def __init__(
         self,
@@ -412,15 +349,6 @@ class GenericFERDataset(CsvImageDataset):
         target_size: Optional[int] = None,
     ):
         super().__init__(csv_file, root_dir, transform, class_map, has_header, sep)
-
-        # Optional MTCNN alignment
-        self.mtcnn = None
-        if enable_alignment:
-            MTCNN = _try_import_mtcnn()
-            if MTCNN is not None:
-                # facenet_pytorch supports CUDA or CPU; prefer CUDA when available
-                mtcnn_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                self.mtcnn = MTCNN(keep_all=False, device=mtcnn_device)
 
         # Tight-crop config (used for pretraining)
         self.crop_tight = bool(crop_tight)
@@ -458,57 +386,12 @@ class GenericFERDataset(CsvImageDataset):
                 f"corrupt {dropped_corrupt}, occluded {dropped_occluded}, blurry {dropped_blurry}")
 
     def _align_crop(self, img: Image.Image) -> Image.Image:
-        # If tight cropping requested, try to detect bbox and crop with margin
-        if self.crop_tight and self.mtcnn is not None:
+        # Simplified: always center-fit to target_size if provided
+        if isinstance(self.target_size, int) and self.target_size > 0:
             try:
-                res = self.mtcnn.detect(img, landmarks=False)
-                boxes, probs = (None, None)
-                if isinstance(res, tuple):
-                    if len(res) >= 1:
-                        boxes = res[0]
-                    if len(res) >= 2:
-                        probs = res[1]
-                if boxes is not None and len(boxes) > 0:
-                    # pick the highest-confidence box
-                    idx = 0
-                    if probs is not None:
-                        idx = int(np.argmax(probs))
-                    x1, y1, x2, y2 = boxes[idx]
-                    w = max(1.0, float(x2 - x1))
-                    h = max(1.0, float(y2 - y1))
-                    m = float(random.uniform(self.margin_range[0], self.margin_range[1]))
-                    dw = m * w
-                    dh = m * h
-                    nx1 = max(0.0, x1 - dw)
-                    ny1 = max(0.0, y1 - dh)
-                    nx2 = min(float(img.width), x2 + dw)
-                    ny2 = min(float(img.height), y2 + dh)
-                    cropped = img.crop((nx1, ny1, nx2, ny2))
-                    # Fit to square target if requested
-                    if isinstance(self.target_size, int) and self.target_size > 0:
-                        try:
-                            cropped = ImageOps.fit(cropped, (self.target_size, self.target_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
-                        except Exception:
-                            cropped = cropped.resize((self.target_size, self.target_size))
-                    return cropped
+                return ImageOps.fit(img, (self.target_size, self.target_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
             except Exception:
-                pass
-
-        # Fallback: default alignment via MTCNN's forward (if available)
-        if self.mtcnn is not None:
-            try:
-                face = self.mtcnn(img, save_path=None)
-                if face is None:
-                    return img
-                if isinstance(face, list):
-                    face = face[0]
-                face = face.clamp(0, 1)
-                pil = TF.to_pil_image(face)
-                if isinstance(self.target_size, int) and self.target_size > 0:
-                    pil = ImageOps.fit(pil, (self.target_size, self.target_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
-                return pil
-            except Exception:
-                return img
+                return img.resize((self.target_size, self.target_size))
         return img
 
     def __getitem__(self, idx):
@@ -794,11 +677,6 @@ def build_weighted_sampler(labels: List[int]) -> WeightedRandomSampler:
 
 
 class EfficientNetFeatureExtractor(nn.Module):
-    """EfficientNet backbone that outputs feature vectors for images.
-
-    - Uses torchvision EfficientNet variants and removes the classifier head
-      so forward() returns pooled features suitable for downstream tasks.
-    """
 
     def __init__(self, variant: str = "b0", pretrained: bool = True):
         super().__init__()
@@ -1260,57 +1138,10 @@ def main():
             balance_sampling=(not args.no_balance),
         )
 
-        # We'll iterate raw samples rather than augmented tensors; set up a detector
-        MTCNN = _try_import_mtcnn()
-        mtcnn = None
-        if MTCNN is not None:
-            mtcnn = MTCNN(keep_all=False, device=('cuda' if torch.cuda.is_available() else 'cpu'))
-        else:
-            print("Warning: facenet_pytorch not available; exporting center-cropped resized images without landmarks.")
+        # We'll iterate raw samples; use center-fit fallback (no landmarks)
 
         def detect_and_crop(pil: Image.Image) -> Tuple[Image.Image, Optional[float], Optional[Tuple[int,int,int,int]], Optional[Tuple[int,int,int,int]], Optional[Tuple[int,int,int,int]]]:
-            # Try tight crop from detection with margin 8-12%, then fit to cfg.img_size
-            if mtcnn is not None:
-                try:
-                    res = mtcnn.detect(pil, landmarks=True)
-                    boxes = probs = points = None
-                    if isinstance(res, tuple):
-                        if len(res) >= 1:
-                            boxes = res[0]
-                        if len(res) >= 2:
-                            probs = res[1]
-                        if len(res) >= 3:
-                            points = res[2]
-                    if boxes is not None and len(boxes) > 0:
-                        idx = 0
-                        if probs is not None:
-                            idx = int(np.argmax(probs))
-                        prob = float(probs[idx]) if probs is not None else None
-                        pts5 = points[idx] if points is not None else None
-                        if pts5 is not None:
-                            aligned, pts_t = align_face_5pt(pil, np.array(pts5, dtype=np.float32), out_size=cfg.img_size, margin=0.10)
-                            le, reye, mo = roi_boxes_from_landmarks(pts_t, out_size=cfg.img_size, eye_size=64, mouth_size=64)
-                            return aligned, prob, le, reye, mo
-                        # Fallback to bbox-based crop
-                        x1, y1, x2, y2 = boxes[idx]
-                        w = max(1.0, float(x2 - x1))
-                        h = max(1.0, float(y2 - y1))
-                        m = 0.10
-                        dw = m * w
-                        dh = m * h
-                        nx1 = max(0.0, x1 - dw)
-                        ny1 = max(0.0, y1 - dh)
-                        nx2 = min(float(pil.width), x2 + dw)
-                        ny2 = min(float(pil.height), y2 + dh)
-                        cropped = pil.crop((nx1, ny1, nx2, ny2))
-                        try:
-                            cropped = ImageOps.fit(cropped, (cfg.img_size, cfg.img_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
-                        except Exception:
-                            cropped = cropped.resize((cfg.img_size, cfg.img_size))
-                        return cropped, prob, None, None, None
-                except Exception:
-                    pass
-            # Fallback to center-fit
+            # Center-fit to size; no detector/landmarks
             try:
                 fitted = ImageOps.fit(pil, (cfg.img_size, cfg.img_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
             except Exception:
@@ -1507,12 +1338,7 @@ def main():
         if cv2 is None:
             raise RuntimeError("OpenCV (cv2) is required for --dmd_export_faces. Install with: pip install opencv-python")
 
-        MTCNN = _try_import_mtcnn()
-        mtcnn = None
-        if MTCNN is not None:
-            mtcnn = MTCNN(keep_all=False, device=('cuda' if torch.cuda.is_available() else 'cpu'))
-        else:
-            print("Warning: facenet_pytorch not available; exporting center-cropped resized frames without landmarks.")
+        # Use center-fit fallback (no detector/landmarks)
 
         # Load JSON annotations if provided
         annotations = None
@@ -1651,46 +1477,7 @@ def main():
             return 'cam0'
 
         def detect_and_crop_frame(pil: Image.Image) -> Tuple[Image.Image, Optional[float], Optional[Tuple[float, float, float, float]], Optional[Tuple[int,int,int,int]], Optional[Tuple[int,int,int,int]], Optional[Tuple[int,int,int,int]]]:
-            if mtcnn is not None:
-                try:
-                    res = mtcnn.detect(pil, landmarks=True)
-                    boxes = probs = points = None
-                    if isinstance(res, tuple):
-                        if len(res) >= 1:
-                            boxes = res[0]
-                        if len(res) >= 2:
-                            probs = res[1]
-                        if len(res) >= 3:
-                            points = res[2]
-                    if boxes is not None and len(boxes) > 0:
-                        idx = 0
-                        if probs is not None:
-                            idx = int(np.argmax(probs))
-                        prob = float(probs[idx]) if probs is not None else None
-                        pts5 = points[idx] if points is not None else None
-                        if pts5 is not None:
-                            aligned, pts_t = align_face_5pt(pil, np.array(pts5, dtype=np.float32), out_size=args.img_size, margin=0.10)
-                            le, reye, mo = roi_boxes_from_landmarks(pts_t, out_size=args.img_size, eye_size=64, mouth_size=64)
-                            return aligned, prob, None, le, reye, mo
-                        # fallback bbox-based
-                        x1, y1, x2, y2 = boxes[idx]
-                        w = max(1.0, float(x2 - x1))
-                        h = max(1.0, float(y2 - y1))
-                        m = 0.10
-                        dw = m * w
-                        dh = m * h
-                        nx1 = max(0.0, x1 - dw)
-                        ny1 = max(0.0, y1 - dh)
-                        nx2 = min(float(pil.width), x2 + dw)
-                        ny2 = min(float(pil.height), y2 + dh)
-                        cropped = pil.crop((nx1, ny1, nx2, ny2))
-                        try:
-                            cropped = ImageOps.fit(cropped, (args.img_size, args.img_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
-                        except Exception:
-                            cropped = cropped.resize((args.img_size, args.img_size))
-                        return cropped, prob, (x1, y1, x2, y2), None, None, None
-                except Exception:
-                    pass
+            # Center-fit to size; no detector/landmarks
             try:
                 fitted = ImageOps.fit(pil, (args.img_size, args.img_size), method=PIL_RESAMPLE_BILINEAR, centering=(0.5, 0.5))
             except Exception:
@@ -2033,7 +1820,9 @@ def main():
             else:
                 print("Warning: could not find state_dict in checkpoint; using ImageNet weights.")
 
-        print(f"Backbone variant={args.eff_variant} feature_dim={backbone.feature_dim}")
+        # Normalize feature_dim to a concrete int for type-checkers
+        feat_dim: int = int(getattr(backbone, 'feature_dim', 0))
+        print(f"Backbone variant={args.eff_variant} feature_dim={feat_dim}")
 
         if args.export_feature_extractor is not None:
             # Save a simple checkpoint with variant and state_dict
@@ -2043,7 +1832,7 @@ def main():
                 'type': 'efficientnet_backbone',
                 'variant': args.eff_variant,
                 'state_dict': backbone.state_dict(),
-                'feature_dim': backbone.feature_dim,
+                'feature_dim': feat_dim,
             }, out_path)
             print(f"Exported feature extractor to: {out_path}")
 
@@ -2065,14 +1854,17 @@ def main():
                 for images, labels in iterable:
                     images = images.to(device, non_blocking=True)
                     try:
-                        with torch.autocast(device_type='cuda', enabled=(isinstance(device, torch.device) and device.type == 'cuda')):
+                        if isinstance(device, torch.device) and device.type == 'cuda':
+                            with torch.autocast(device_type='cuda'):
+                                feats = backbone(images)
+                        else:
                             feats = backbone(images)
                     except Exception:
                         feats = backbone(images)
                     feats = feats.detach().cpu().numpy()
                     feats_list.append(feats)
                     labels_list.extend(labels.detach().cpu().numpy().tolist())
-            feats_all = np.concatenate(feats_list, axis=0) if feats_list else np.zeros((0, backbone.feature_dim), dtype=np.float32)
+            feats_all = np.concatenate(feats_list, axis=0) if feats_list else np.zeros((0, feat_dim), dtype=np.float32)
             labels_all = np.array(labels_list, dtype=np.int64)
             out_npz = args.extract_features_out
             os.makedirs(os.path.dirname(os.path.abspath(out_npz)) or ".", exist_ok=True)
