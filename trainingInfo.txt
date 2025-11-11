@@ -1,0 +1,22 @@
+Key training settings:
+
+-Arcface:
+  Scale: 15
+  Margin: 0.25
+
+-Generic:
+  LR: Adam with 3e-4
+  Epochs: 15
+
+-DMD:
+  80 frame cap per annotated action
+  Max 1500 frames per video
+  LR: AdamW with 1e-4(head-only) and 1e-5(unfreeze)
+  Epochs: 15 total (3 head-only, 12 unfreeze)
+
+
+Important choices:
+
+-Model doesn't actually directly detect fatigue directly. The model makes inference based on the dmd classes, then later in application implementation
+  a binary mapping (0=no fatigue, 1=fatigue) needs to be created. For example (not actual mapping): classes 1-9 = 0 (no fatigue), classes 10-17 = 1 (fatigue) (NOT REAL MAPPINGS).
+  Seems counterintuitive but helps allow flexibility so you can change mappings based on real experience later on.
