@@ -1,4 +1,4 @@
-#DEBUG NO FULL DROWSINESS BUILD
+﻿#DEBUG NO FULL DROWSINESS BUILD
 #NOT to be submitted. It works and can be run with correct dataset directories but it's a bloated beast full of a bunch of unnecessary code that should be cut before submitting.
 
 #CSCI 49500 - FER DSM Project
@@ -11,11 +11,12 @@ import random
 import csv
 import io
 import argparse
+import math
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Iterable
+from typing import Optional, List, Tuple, Dict, Iterable, Sequence
 import numpy as np
 import multiprocessing as mp
-from collections import Counter
+from collections import Counter, defaultdict
 from tqdm.auto import tqdm as _tqdm
 import cv2
 import pandas as pd
@@ -49,8 +50,7 @@ except Exception:
 
 def _ensure_list_metric(x):
     try:
-        import numpy as _np
-        return _np.asarray(x).reshape(-1).tolist()
+        return np.asarray(x).reshape(-1).tolist()
     except Exception:
         try:
             return [float(x)]
@@ -71,38 +71,82 @@ def _safe_int(x: _Any) -> int:
     except Exception:
         return 0
 try:
-    from PIL.Image import Resampling as _PILResampling
-    PIL_RESAMPLE_BILINEAR: _Any = _PILResampling.BILINEAR
+    from PIL.Image import Resampling
+    PIL_RESAMPLE_BILINEAR: _Any = Resampling.BILINEAR
 except Exception:
     PIL_RESAMPLE_BILINEAR: _Any = getattr(Image, 'BILINEAR', 2)
-RGBColor = _Any
-COL_20: RGBColor = (20, 20, 20)
-COL_60: RGBColor = (60, 60, 60)
-COL_100: RGBColor = (100, 100, 100)
 
 # Stable global mapping for DMD OpenLABEL action names -> integer ids.
 # This can be extended at runtime if new action names are encountered.
 DMD_ACTION_NAME_TO_ID: Dict[str, int] = {
     'neutral': 0,
-    'gaze': 1,
-    'distraction': 2,
-    'phone': 3,
+    "eyes_opened": 1,
+    "eyes_closed": 2,
+    "eyes_opening": 3,
+    "eyes_closing": 4,
+    "blinking": 5,
+    "yawn_no_hand": 6,
+    "yawn_with_hand": 7,
+    "occl_face": 8,
+    "occl_body": 9,
+    "occl_hands": 10,
 }
+
+# ---- DMD OpenLABEL type → 11-class id (canonical) ----
+# 0 none, 1 eyes_opened, 2 eyes_closed, 3 eyes_opening, 4 eyes_closing,
+# 5 blinking, 6 yawn_no_hand, 7 yawn_with_hand, 8 occl_face, 9 occl_body, 10 occl_hands
+DMD_TYPE_TO_ID: Dict[str, int] = {
+    # Eyes state
+    "eyes_state/open": 1,
+    "eyes_state/close": 2,
+    "eyes_state/opening": 1,
+    "eyes_state/closing": 2,
+    "eyes_state/undefined": 0,   # seen in some files
+
+    # Blinks
+    "blinks/blinking": 5,
+
+    # Yawning (exact strings from dataset; keep lowercase)
+    "yawning/yawning with hand": 7,
+    "yawning/yawning without hand": 6,
+
+    # Occlusions (appear in some splits)
+    "occlusion/face occlusion": 8,
+    "occlusion/body occlusion": 9,
+    "occlusion/hands occlusion": 10,
+}
+
+# Priority when multiple labels overlap in the same frame (higher wins)
+DMD_PRIORITY: Dict[int, int] = {
+    8: 400, 9: 400, 10: 400,        # occlusions dominate
+    7: 300, 6: 300,                 # yawns
+    5: 200,                         # blink
+    4: 100, 3: 100, 2: 100, 1: 100, # eyes state
+    0: 0,
+}
+
+
 
 def dmd_label_id_for(name: _Any) -> Optional[int]:
     try:
         if isinstance(name, int):
-            return int(name)
-        if not isinstance(name, str):
-            return None
-        key = name.strip().lower()
-        if not key:
-            return None
-        if key not in DMD_ACTION_NAME_TO_ID:
-            DMD_ACTION_NAME_TO_ID[key] = int(max(DMD_ACTION_NAME_TO_ID.values()) + 1) if DMD_ACTION_NAME_TO_ID else 0
-        return DMD_ACTION_NAME_TO_ID[key]
+            return name
+        if isinstance(name, str):
+            s = name.strip()
+            if not s:
+                return None
+            if s.isdigit():
+                return int(s)           # keep JSON numeric IDs as-is
+            key = s.lower()
+            if key in ('neutral', 'none'):
+                return 0                # protect class 0
+            if key in DMD_ACTION_NAME_TO_ID:
+                return DMD_ACTION_NAME_TO_ID[key]
+            return None                 # drop unknown free-text instead of inventing new IDs
+        return None
     except Exception:
         return None
+
 
 # AffectNet primary-8 name mapping (default)
 AFFECTNET_PRIMARY8_NAME_TO_ID: Dict[str, int] = {
@@ -117,7 +161,6 @@ AFFECTNET_PRIMARY8_NAME_TO_ID: Dict[str, int] = {
 }
 
 def _affectnet_clean(labels_csv: str, images_root: str, cache_dir: Optional[str]=None, seven_class: bool=False) -> Tuple[str, Dict[_Any, int], List[int], Dict[int, int]]:
-    import pandas as _pd
     cache_dir = cache_dir or os.path.join(os.getcwd(), 'outputs', 'affectnet_cache')
     os.makedirs(cache_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(labels_csv))[0]
@@ -149,7 +192,7 @@ def _affectnet_clean(labels_csv: str, images_root: str, cache_dir: Optional[str]
     except Exception:
         pass
 
-    df = _pd.read_csv(labels_csv)
+    df = pd.read_csv(labels_csv)
     # Drop junk columns
     junk = [c for c in df.columns if c.lower().startswith('unnamed') or c.lower().startswith('rel')]
     if junk:
@@ -1089,8 +1132,7 @@ def build_loaders(cfg: TrainConfig, device: Optional[torch.device]=None):
         if cfg.affectnet_csv and os.path.isfile(cfg.affectnet_csv):
             # Peek to decide if already cleaned (two columns, no header)
             try:
-                import pandas as _pd
-                df = _pd.read_csv(cfg.affectnet_csv)
+                df = pd.read_csv(cfg.affectnet_csv)
                 if df.shape[1] <= 2 and {'label'}.issubset(set(map(str.lower, df.columns.tolist()))):
                     # Might still be raw; prefer explicit labels_csv flag instead
                     pass
@@ -1345,14 +1387,6 @@ def run_training():
             cfg.dmd_root = dmd_out_root
         except Exception as e:
             print(f'Warning: DMD export failed or skipped: {e}')
-    # Optional: preprocess AffectNet labels if provided
-    # Use environment or discovered defaults to locate AffectNet root
-    # Keep RAF-DB untouched
-    try:
-        # Determine if user passed labels CSV via CLI
-        import argparse as _ap
-    except Exception:
-        pass
     # If a cleaned CSV exists in CWD, prefer it
     if not cfg.affectnet_csv:
         p_clean = os.path.join(os.getcwd(), 'affectnet_train.csv')
@@ -1544,7 +1578,6 @@ def run_training():
                 feats = backbone(images)
                 logits_pred = head_m(feats, None)
                 ce = nn.CrossEntropyLoss()(logits_pred, labels).item()
-            import math
             exp = math.log(max(2, int(cfg.num_classes)))
             print(f"Sanity: label-free CE={ce:.3f} (expected ~log(K)={exp:.3f}) for K={int(cfg.num_classes)}")
             if ce < 0.2:
@@ -1617,6 +1650,33 @@ def run_training():
         train_ds, val_ds = random_split(ds_full, [train_n, val_n], generator=torch.Generator().manual_seed(456))
         if hasattr(val_ds, 'dataset') and hasattr(val_ds.dataset, 'transform'):
             cast(_Any, val_ds.dataset).transform = val_tf
+
+
+        # === Remap labels to 0..K-1 based on union of labels present in train+val ===
+        # Build index lists for the two Subset objects produced by random_split
+        train_indices = list(getattr(train_ds, 'indices', []))
+        val_indices   = list(getattr(val_ds, 'indices', []))
+
+        # Compute union of labels actually present
+        labs_union = sorted(set(int(ds_full.samples[i][1]) for i in (train_indices + val_indices)))
+        class_to_idx = {cls: i for i, cls in enumerate(labs_union)}
+
+        # In-place relabel the underlying ds_full.samples for just the selected indices
+        for i in (train_indices + val_indices):
+            rp, rl = ds_full.samples[i]
+            ds_full.samples[i] = (rp, int(class_to_idx[int(rl)]))
+
+        # Recreate Subset views so they see the remapped labels
+        train_ds = Subset(ds_full, train_indices)
+        val_ds   = Subset(ds_full, val_indices)
+
+        # K is the dynamic number of classes; keep it for head construction later
+        K = len(labs_union)
+        print(f"[DMD] classes={K} unique={labs_union}")
+        # ============================================================================
+
+
+
         # Weighted sampler + ultra-rare drop
         def labels_from_subset(sub):
             lbls = []
@@ -1638,8 +1698,12 @@ def run_training():
             return lbls
         # Drop ultra-rare classes (<3 samples) from train
         _labs = labels_from_subset(train_ds)
-        from collections import Counter as _Ctr
-        _hist = _Ctr(_labs)
+
+        _hist = Counter(_labs)
+
+        rare = set()
+
+        '''
         rare = set([k for k, v in _hist.items() if v < 3])
         if rare:
             base = train_ds.dataset
@@ -1661,6 +1725,7 @@ def run_training():
             train_ds = Subset(base, keep)
             if dropped > 0:
                 print(f"[DMD] dropped {dropped} samples from ultra-rare classes (<3 train samples)")
+        '''
         sampler = build_weighted_sampler(labels_from_subset(train_ds))
         num_workers = get_num_workers()
         pin_mem = isinstance(device, torch.device) and getattr(device, 'type', 'cpu') == 'cuda'
@@ -1794,7 +1859,6 @@ def run_training():
                 try:
                     K = int(num_classes_dmd)
                     # compute macro-F1
-                    import math
                     f1s = []
                     for c in range(K):
                         tp = sum(1 for p, t in zip(preds_all, labels_all) if p == c and t == c)
@@ -1819,7 +1883,6 @@ def run_training():
                 try:
                     if _prfs is not None and _confusion_matrix is not None and preds_all is not None and labels_all is not None:
                         Kloc = int(num_classes_dmd)
-                        import numpy as _np
                         prec_arr, rec_arr, f1_arr, sup_arr = _prfs(labels_all, preds_all, labels=list(range(Kloc)), zero_division=0)
                         prec_arr = _ensure_list_metric(prec_arr); rec_arr = _ensure_list_metric(rec_arr); f1_arr = _ensure_list_metric(f1_arr); sup_arr = _ensure_list_metric(sup_arr)
                         print('class_id | precision | recall | f1 | support')
@@ -1922,8 +1985,7 @@ def run_gen_csv_from_rafdb(root_dir: str, out_csv: str, split: str='train', imag
 
 def _gen_csv_from_affectnet_labels(labels_csv: str, images_root: str, out_csv: str, keep_classes: Iterable[int], map_unknown: Optional[int]=None, out_map_json: Optional[str]='affectnet_map.json') -> int:
     # Load labels.csv and emit a cleaned CSV with contiguous labels 0..K-1
-    import pandas as _pd
-    df = _pd.read_csv(labels_csv)
+    df = pd.read_csv(labels_csv)
     # heuristics for columns
     path_cols = ['path', 'file', 'image', 'subDirectory_filePath', 'subdirectory_file_path', 'filename']
     label_cols = ['label', 'expression', 'expr']
@@ -2097,6 +2159,12 @@ def run_finetune_dmd(backbone_ckpt: str, dmd_csv: str, dmd_root: Optional[str], 
     # ensure val uses val transforms
     if hasattr(val_ds, 'dataset') and hasattr(val_ds.dataset, 'transform'):
         cast(_Any, val_ds.dataset).transform = val_tf
+
+
+
+
+
+
     # Weighted sampler for train
     def labels_from_subset(sub):
         lbls = []
@@ -2113,8 +2181,7 @@ def run_finetune_dmd(backbone_ckpt: str, dmd_csv: str, dmd_root: Optional[str], 
         return lbls
     # Drop ultra-rare classes (<3 samples) from train
     _labs = labels_from_subset(train_ds)
-    from collections import Counter as _Ctr
-    _hist = _Ctr(_labs)
+    _hist = Counter(_labs)
     rare = set([k for k, v in _hist.items() if v < 3])
     if rare:
         base = train_ds.dataset
@@ -2551,12 +2618,12 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
     os.makedirs(out_root, exist_ok=True)
 
     # Permissive quality thresholds (env-overridable)
-    blur_cutoff = float(os.environ.get('DMD_BLUR_CUTOFF', '40.0'))
-    exposure_min = float(os.environ.get('DMD_EXPOSURE_MIN', '10.0'))
-    exposure_max = float(os.environ.get('DMD_EXPOSURE_MAX', '245.0'))
-    skin_min = float(os.environ.get('DMD_SKIN_MIN_FRAC', '0.20'))
+    blur_cutoff = float(os.environ.get('DMD_BLUR_CUTOFF', '25.0'))
+    exposure_min = float(os.environ.get('DMD_EXPOSURE_MIN', '5.0'))
+    exposure_max = float(os.environ.get('DMD_EXPOSURE_MAX', '250.0'))
+    skin_min = float(os.environ.get('DMD_SKIN_MIN_FRAC', '0.10'))
 
-    sample_every = int(os.environ.get('DMD_SAMPLE_EVERY', '0'))
+    sample_every = int(os.environ.get('DMD_SAMPLE_EVERY', '1'))
     _sf = os.environ.get('DMD_SAMPLE_FPS', '').strip()
     sample_fps = float(_sf) if _sf else None
     exclude_boundary_s = 0.5
@@ -2645,13 +2712,19 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
             return 'val'
         return 'train'
 
-    def _parse_openlabel_actions(json_obj: dict, fps: float) -> List[Tuple[int,int,str]]:
+    def _parse_openlabel_actions(json_obj: dict, fps: float) -> List[Tuple[int, int, int]]:
+        """
+        Build intervals from OpenLABEL actions using the action 'type' string
+        mapped to our 11-class IDs via DMD_TYPE_TO_ID.
+        Returns a list of (frame_start, frame_end, class_id).
+        """
         ol = json_obj.get('openlabel') or json_obj
         actions = ol.get('actions') or {}
-        out: List[Tuple[int,int,str]] = []
+        out: List[Tuple[int, int, int]] = []
         if not isinstance(actions, dict) or not actions:
             return out
-        def _to_frames(lo, hi) -> Optional[Tuple[int,int]]:
+
+        def _to_frames(lo, hi) -> Optional[Tuple[int, int]]:
             try:
                 if lo is None or hi is None:
                     return None
@@ -2666,39 +2739,42 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
             except Exception:
                 return None
             return None
+
         for _aid, act in actions.items():
             try:
                 if not isinstance(act, dict):
                     continue
-                name = act.get('name') or act.get('semantic') or act.get('type') or ''
-                if not isinstance(name, str) or not name:
-                    continue
-                intervals = act.get('frame_intervals') or act.get('intervals') or act.get('time_intervals') or []
+                typ = (act.get('type') or '').strip().lower()
+                cid = DMD_TYPE_TO_ID.get(typ, 0)  # unknown → neutral (0)
+
+                intervals = (act.get('frame_intervals') or
+                            act.get('intervals') or
+                            act.get('time_intervals') or [])
                 for it in intervals:
                     lo = hi = None
                     if isinstance(it, (list, tuple)) and len(it) >= 2:
                         lo, hi = it[0], it[1]
                     elif isinstance(it, dict):
                         lo = it.get('frame_start') if 'frame_start' in it else (it.get('start') or it.get('t0'))
-                        hi = it.get('frame_end') if 'frame_end' in it else (it.get('end') or it.get('t1'))
+                        hi = it.get('frame_end')   if 'frame_end'   in it else (it.get('end')   or it.get('t1'))
                     rng = _to_frames(lo, hi)
                     if rng is None:
                         continue
                     a, b = rng
                     if b < a:
                         a, b = b, a
-                    out.append((int(a), int(b), str(name)))
+                    out.append((int(a), int(b), int(cid)))
             except Exception:
                 continue
-        out.sort(key=lambda t: (t[0], t[1], t[2].lower()))
+
+        out.sort(key=lambda t: (t[0], t[1], t[2]))
         return out
 
-    def _sample_frames(intervals: List[Tuple[int,int,str]], fps: float) -> List[int]:
-        # Target ~2 Hz time-based sampling with min spacing in frames
+    def _sample_frames(intervals: Sequence[Tuple[int, int, int]], fps: float) -> List[int]:
         TARGET_FPS = 2.0
-        MIN_SPACING = 3  # frames
+        MIN_SPACING = 3
         frames: List[int] = []
-        for a, b, _nm in intervals:
+        for a, b, _cid in intervals:
             if b < a:
                 a, b = b, a
             length = max(0, b - a + 1)
@@ -2713,9 +2789,7 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
             if length <= step:
                 frames.append(int(a + length // 2))
             else:
-                # uniform stepping
                 cand = list(range(int(a), int(b) + 1, int(step)))
-                # enforce min spacing
                 filtered: List[int] = []
                 last = None
                 for f in cand:
@@ -2725,35 +2799,29 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
                 frames.extend(filtered)
         return sorted(set(int(x) for x in frames if x >= 0))
 
-    def _choose_label_for_frame(fidx: int, intervals: List[Tuple[int,int,str]]) -> Optional[int]:
-        best = None
-        for a, b, nm in intervals:
+    def _choose_label_and_interval(
+        fidx: int,
+        intervals: Sequence[Tuple[int, int, int]]
+    ) -> Optional[Tuple[int, Tuple[int, int, int]]]:
+        """
+        Pick a single label for frame fidx from intervals of (a, b, cid),
+        preferring higher DMD_PRIORITY, then longer duration, then cid.
+        Returns (label_id, (a, b, cid)) or None if nothing active.
+        """
+        best_key = None  # (priority, duration, cid)
+        best_iv = None
+        for a, b, cid in intervals:
             if a <= fidx <= b:
+                pr = DMD_PRIORITY.get(int(cid), 0)
                 dur = int(b - a + 1)
-                lab = dmd_label_id_for(nm)
-                if lab is None:
-                    continue
-                key = (dur, nm.lower(), lab)
-                if best is None or key > best:
-                    best = key
-        if best is None:
+                key = (pr, dur, int(cid))
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best_iv = (a, b, int(cid))
+        if best_iv is None:
             return None
-        return int(best[2])
+        return (best_iv[2], best_iv)
 
-    def _choose_label_and_interval(fidx: int, intervals: List[Tuple[int,int,str]]) -> Optional[Tuple[int, Tuple[int,int,str]]]:
-        best = None  # (dur, name, id, (a,b,name))
-        for a, b, nm in intervals:
-            if a <= fidx <= b:
-                dur = int(b - a + 1)
-                lab = dmd_label_id_for(nm)
-                if lab is None:
-                    continue
-                key = (dur, nm.lower(), lab, (a, b, nm))
-                if best is None or key > best:
-                    best = key
-        if best is None:
-            return None
-        return (int(best[2]), best[3])
 
     # Detection/cropping helper (reuse relaxed behavior)
     def detect_and_crop_frame(bgr: np.ndarray):
@@ -2879,21 +2947,65 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
                 continue
             frame_indices = _sample_frames(intervals, float(fps))
             if exclude_boundary_s and duration is not None and duration > 0:
-                lo = exclude_boundary_s; hi = max(0.0, duration - exclude_boundary_s)
-                frame_indices = [fi for fi in frame_indices if (float(fi)/float(fps)) >= lo and (float(fi)/float(fps)) <= hi]
-            print(f'  Pair: video={vid_path} json={json_path} actions={len(intervals)} sampled_frames={len(frame_indices)}')
+                lo = float(exclude_boundary_s)
+                hi = max(0.0, float(duration) - float(exclude_boundary_s))
+                frame_indices = [fi for fi in frame_indices if (float(fi) / float(fps)) >= lo and (float(fi) / float(fps)) <= hi]
+
+            print(
+                f"  Pair: video={vid_path} json={os.path.basename(json_path)} "
+                f"actions={len(intervals)} sampled_frames={len(frame_indices)}"
+            )
+
             if not frame_indices:
-                cap.release(); continue
+                cap.release()
+                continue
+
             session_id = os.path.basename(folder)
             history: List[Tuple[float, int]] = []
-            per_interval_counts: Dict[Tuple[int,int,str], int] = {}
+            per_interval_counts: Dict[Tuple[int, int, int], int] = {}
+
+            # ---- DMD export local toggles (no env) ----
+            DMD_INCLUDE_NEG = True    # allow unlabeled frames to map to neutral
+            DMD_NONE_ID     = 0       # neutral/none class ID
+
+            # Initialize counters once before the loop
+            frame_counter = 0
+            total_frames = len(frame_indices)
+            prev_idx = -1
+
+
             for fidx in frame_indices:
-                li = _choose_label_and_interval(int(fidx), intervals)
-                if li is None:
+                frame_counter += 1
+                if frame_counter % 100 == 0:
+                    print(f"[DMD][export] {vid_path}: {frame_counter}/{total_frames} frames processed...")
+
+                # ---- fast seek / decode ----
+                fi = int(fidx)
+                if prev_idx >= 0 and fi > prev_idx:
+                    to_skip = fi - prev_idx - 1
+                    for _ in range(to_skip):
+                        cap.grab()
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+
+                ok, frame = cap.read()
+                prev_idx = fi
+                if not ok or frame is None:
                     continue
-                label_id, interval_key = li
-                if label_id is None:
+
+                # labeling with in-script negative fallback
+                # Genuinely hell code right here, so many problems stemmed from this specific block of code
+                li = _choose_label_and_interval(fi, intervals)  # Optional[(label_id, (a,b,cid))]
+                if not li or li[0] is None:
+                    label_id = int(DMD_NONE_ID)
+                    interval_key = (-1, -1, -1)  # all-int key to satisfy Dict[Tuple[int,int,int],int]
+                else:
+                    label_id, interval_key = li  # interval_key is (a,b,cid) -> all int
+
+                if label_id in (8, 9, 10):
                     continue
+
+
                 # Per-interval cap enforced via a simple counter keyed by (start,end,label)
                 # Approximate by counting per label across this video segment
                 key_vc = (vid_path, int(label_id))
@@ -2903,13 +3015,6 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
                 # Interval cap
                 c_int = per_interval_counts.get(interval_key, 0)
                 if c_int >= PER_INTERVAL_CAP:
-                    continue
-                try:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
-                except Exception:
-                    pass
-                ok, frame = cap.read()
-                if not ok or frame is None:
                     continue
                 crop, prob, bbox, le, reye, mo = detect_and_crop_frame(frame)
                 if crop is None or not isinstance(crop, Image.Image):
@@ -2958,17 +3063,15 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
     rows_before = len(rows_csv)
     try:
         train_rows = [r for r in rows_csv if r[4] == 'train']
-        from collections import defaultdict
         by_label: Dict[int, List[Tuple]] = defaultdict(list)
         for r in train_rows:
             by_label[int(r[1])].append(r)
         # oversample
-        import random as _rnd
         labels_all = sorted(set(int(r[1]) for r in train_rows))
         for lab in labels_all:
             cur = len(by_label.get(lab, []))
             while cur < TRAIN_MIN_PER_CLASS and by_label.get(lab):
-                src = _rnd.choice(by_label[lab])
+                src = random.choice(by_label[lab])
                 # duplicate row (reuse path)
                 rows_csv.append(src)
                 hist_by_split['train'][lab] += 1
@@ -2976,6 +3079,7 @@ def _run_dmd_export_new(out_root: Optional[str]=None) -> None:
     except Exception:
         pass
     rows_after = len(rows_csv)
+
 
     # Write CSV
     csv_path = os.path.join(out_root, 'dmd_frames.csv')
