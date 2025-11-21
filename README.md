@@ -12,11 +12,12 @@ dsm_superVerified.py is a very heavy debug version of the script and is verified
 Any other version is not to be ran and is used for demonstration purposes only. They're ability to be ran has not been verified.
 
 Install requirements.txt to virtual environment using
-'''pip install -r requirements.txt'''
+```pip install -r requirements.txt```
 
 When running, first run
-'''python dsm_file.py --dmd-export'''
+```python dsm_file.py --dmd-export```
 to generate proper csv and mapping files for the dmd dataset.
+
 Then you can run
-'''python dsm_file.py --train'''
+```python dsm_file.py --train```
 to properly train the model.
