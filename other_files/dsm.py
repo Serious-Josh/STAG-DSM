@@ -1,4 +1,5 @@
 ﻿#DEBUG FULL DROWSINESS BUILD
+#NOT to be submitted. It works and can be run with correct dataset directories but it's a bloated beast full of a bunch of unnecessary code that should be cut before submitting.
 
 #CSCI 49500 - FER DSM Project
 #Basharat, Derek, Josh, Madison
