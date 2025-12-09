@@ -25,3 +25,10 @@ to generate proper csv and mapping files for the dmd dataset.
 Then you can run
 ```python dsm_file.py --train```
 to properly train the model.
+
+----------------------------------------------------------------
+
+Scripts/ contains two sub-directories based on model implementation.
+
+- Single Script/ is for video capture and inference on a single piece of hardware: fully edge device, desktop, etc.
+- Two Script/ is for one script to run on an edge device for video capture, and one to run on dedicated hardware/server for inference.
