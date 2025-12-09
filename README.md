@@ -12,19 +12,22 @@ Directory structure must be as given here:
     /DMD
 ```
 
-dsm_superVerified.py is a very heavy debug version of the script and is verified to be runnable. It is the version all development and testing was performed with.
-Any other version is not to be ran and is used for demonstration purposes only. They're ability to be ran has not been verified.
+If issues are encountered with dsm_FD.py, attempt with other_files/dsm_superVerified.py. dsm_superVerified.py is a very heavy debug version of the script and is verified to be runnable. It is the version all development and testing was performed with.
+Any other version within other_files is not to be ran and is used for demonstration purposes only, their ability to be ran has not been verified and is left for archival purposes.
 
-Install requirements.txt to virtual environment using
+Install requirements.txt to virtual environment using  
 ```pip install -r requirements.txt```
 
-When running, first run
-```python dsm_file.py --dmd-export```
+When running, first run  
+```python dsm_yourFile.py --dmd-export```  
 to generate proper csv and mapping files for the dmd dataset.
 
-Then you can run
-```python dsm_file.py --train```
+Then you can run  
+```python dsm_yourFile.py```  
 to properly train the model.
+
+If running dsm_superVerified.py, instead run with  
+```python dsm_superVerified.py --train```
 
 ----------------------------------------------------------------
 
