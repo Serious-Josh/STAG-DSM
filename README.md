@@ -1,6 +1,6 @@
 A DSM-FER system to detect fatigue in a driver. Utilizes a custom architecture named STAG.
 
-dsm.py is the runnable version and requires correct dataset root setup. [Google Drive](https://drive.google.com/drive/folders/1IUQ5uUj5Mw7sXoiluSbwrMNoMlmJ1Iih?usp=sharing) link.
+dsm_FD.py is the runnable version and requires correct dataset root setup. [Google Drive](https://drive.google.com/drive/folders/1IUQ5uUj5Mw7sXoiluSbwrMNoMlmJ1Iih?usp=sharing) link.
 
 Directory structure must be as given here:
 ```
